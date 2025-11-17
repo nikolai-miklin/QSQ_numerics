@@ -1,40 +1,50 @@
-function [Pfail,inFid,r] = QSQnumericsSn
+function [Pfail,inFid,r] = QSQnumericsSn(n,n_sample,Pfail_max)
 % QSQNUMERICSSN is a function that runs numerical analysis for 
 % arXiv:2411.04215 for S_n model
+% 
+% This program samples random noisy models, and plots the dependancy
+% between model distances (e.g., infidelity) vs. failing probability
+% Partial unitary gauge optimization is performed. In the paper, this
+% corresponds to the final step of the proof for S_n model where the global
+% phases are fixed.
+% Each noise model is parametrized by the noise strength, which is a single
+% general parameter, alpha, which is adjusted for each sampled model
+% in order to keep Pfail<Pfail_max
+% Input:
+%   n -- number of qubits
+%   n_sample -- number of randomly sampled noisy models
+%   Pfail_max -- maximum failing probability
 % Output: 
 %   Pfail -- average failing probability
-%   inFid.val -- the largest infidelity among
+%   inFid.max -- the largest infidelity among
 %         the gates (average gate infidelity)
-%         the state (infidelity)
-%         the measurement (total var distance)
+%   inFid.avg -- the average gate set infidelity
+%   inFid.rho -- infidelity for the initial state
+%   inFid.meas -- the total variational distance for the measurement
 %   inFid.type -- specfies which of the infidelities is the largest:
-%              = 1 if it's the state
-%              = 2 if it's the gates
+%              = 1 if it's the gates (averaged)
+%              = 2 if it's the state
 %              = 3 if it's the measurement
+%   r.avg -- the worst ratio between the average gate set infidelity and
+%   the failing probability
+%   r.max -- the same for the worst infidelity among the gates
 
-% -------------------------- main parameters ---------------------------
-n = 4; % number of qubits
-nn = 10^5; % number of samples
-% levels of noise (relative to each other, should sum up to 1)
-% the actual level of noise is adjusted such that maximal Pfail ~ Pfail_max
-noise.U1 = 1; % for single-qubit unitary noise applied to gates
-noise.Un = 0; % for n-qubit unitary noise applied to gates
-noise.dep = 0; % depolarizing noise
-noise.rho = 0; % for white noise applied to the state
-noise.M = 0; % for the readout noise 
-noise.alpha = .5; % scaling parameter (is adjusted automatically)
-Pfail_max = 0.03; % maximal failling probability to be shown on the plot 
-nmin = 20; % number of random points for the minimization
-% set to 0 is no minimization is required
+% fix the general parameters for noise
+noise_param.U1 = .1; % amount of single-qubit noise
+noise_param.Un = .9; % amount of multi-qubit noise
+noise_param.dep = 0; % depolarizing noise
+noise_param.rho = 0; % white noise applied to the state
+noise_param.M = 0; % readout noise 
 
-% -------------------------- parameters for determinig the ratio -------
-eps = 10^(-5); % don't consider points below this threshold
-ep = 10^(-3); % precision to which to determine the ratio
-r = .1; % initial ratio
-
-Pfail = zeros(1,nn);
-inFid.val = zeros(1,nn);
-inFid.type = zeros(1,nn);
+% pre-alocate the memory
+r.avg = 0;
+r.max = 0;
+Pfail = zeros(1,n_sample);
+inFid.max = zeros(1,n_sample);
+inFid.type = zeros(1,n_sample);
+inFid.avg = zeros(1,n_sample);
+inFid.rho = zeros(1,n_sample);
+inFid.meas = zeros(1,n_sample);
 
 % ------------------------- sequences, target model and outcomes -------
 X = Sequences(n); % every cell contains a sequence
@@ -42,32 +52,47 @@ p = ones(1,numel(X))/numel(X); % distribution w.r.t. which sequences are drawn
 Mod0 = TargetModel(n);
 a_x = TargetOutcomes(X,Mod0,n); % every cell contains target outcomes
 
-% adjust the noise level
-noise = AdjustNoise(X,a_x,Mod0,noise,p,Pfail_max,n,100);
 
-flag = 0;
+alpha_max = 1;
 disp(' Progress:   ')
-for k=1:nn
-    if round(4*k/nn)>flag
-        flag = flag+1;
-        noise.alpha = noise.alpha*0.5; % try to cover all ranges of noise levels
+for k=1:n_sample
+    DisplayProgress(k,n_sample); % displays progress in percentage
+    noise = Noise(n,numel(Mod0.gates)); % generate the noise model
+    alpha = alpha_max/2;
+    d_alpha = alpha_max/2;
+    Mod = NoisyModel(noise,noise_param,n,Mod0,alpha); % create the noisy model
+    pfail = 1-QuizzingProb(X,a_x,Mod)*p'; % the failing prob
+    % do a biary search over the noise strength parameter alpha
+    while d_alpha>10^(-5)
+        d_alpha = d_alpha/2;
+        if pfail>Pfail_max
+            alpha = alpha-d_alpha;
+        else
+            alpha = alpha+d_alpha;
+        end
+        Mod = NoisyModel(noise,noise_param,n,Mod0,alpha);
+        pfail = 1-QuizzingProb(X,a_x,Mod)*p';
     end
-    DisplayProgress(k,nn); % displays progress in percentage
-    Mod = NoisyModel(noise,n,Mod0);
-    % calculate the probability of the noisy model failing the protocol 
+    % now take a random point in between
+    Mod = NoisyModel(noise,noise_param,n,Mod0,alpha*rand(1));
     Pfail(k) = 1-QuizzingProb(X,a_x,Mod)*p';
-    % calculate the infidelity (partial unitary gauge optimization)
-    if Pfail(k)>eps
-        [inFid.val(k),r,inFid.type(k)] = Infidelity(Mod0,Mod,n,r,Pfail(k),ep,nmin);
-        % here the ratio r is updated, if inFid.val is below the line
-        % determined by r, no optimization is performed
-    else
-        % if the point is too close to the origin, simply igore it
-        inFid.val(k) = r*eps; % (inFid_type(k) = 0)
+    % calculate the infidelity
+    [inFid.max(k),inFid.avg(k),inFid.rho(k),inFid.meas(k),inFid.type(k)] = Infidelity(Mod0,Mod,n);
+    % here the ratios r are updated (points too close and too far from the origin
+    % are ignored
+    if Pfail(k)>10^(-6) && Pfail(k)<Pfail_max
+        r_max = inFid.max(k)/Pfail(k);
+        r_avg = inFid.avg(k)/Pfail(k);
+        if r_max>r.max
+            r.max = r_max;
+        end
+        if r_avg>r.avg
+            r.avg = r_avg;
+        end
     end
+end
 end
 
-end
 
 %% ---------- Quzzing probability ----------
 
@@ -88,28 +113,6 @@ end
 
 end
 
-%% ---------- Noise level adjustment ----------
-function noise = AdjustNoise(X,a_x,Mod0,noise,p,Pfail_max,n,nn)
-% ADJUSTNOISE automatically adjusts the noise level such that the maximal
-% faling probability is (approx.) Pfail_max by sampling nn random models
-
-
-alpha_d = noise.alpha/2;
-while alpha_d>10^(-5)
-% binary search
-    Pfail_avg = 0;
-    for k=1:nn
-        Mod = NoisyModel(noise,n,Mod0);
-        Pfail_avg = max(Pfail_avg,1-real(QuizzingProb(X,a_x,Mod))*p');
-    end
-    if Pfail_avg>Pfail_max
-        noise.alpha = noise.alpha-alpha_d;
-    else
-        noise.alpha = noise.alpha+alpha_d;
-    end
-    alpha_d = alpha_d/2;
-end
-end
 
 %% ---------- Target sequences ----------
 
@@ -122,6 +125,26 @@ if n==1
     X{1} = [];
     X{2} = [1 1];
     X{3} = [1 1 1 1];
+% elseif n==2
+%     X{1} = [];
+%     X{2} = [1];
+%     X{3} = [1, 1];
+%     X{4} = [1, 1, 1];
+%     X{5} = [1, 1, 1, 1];
+%     X{6} = [2, 2, 1];
+%     X{7} = [2, 2, 1, 1];
+%     X{8} = [2, 2, 1, 1, 1];
+%     X{9} = [2, 2, 1, 1, 1, 1];
+%     X{10} = [2, 1, 2, 1];
+%     X{11} = [2];
+%     X{12} = [2, 2];
+%     X{13} = [2, 2, 2];
+%     X{14} = [2, 2, 2, 2];
+%     X{15} = [1, 1, 2];
+%     X{16} = [1, 1, 2, 2];
+%     X{17} = [1, 1, 2, 2, 2];
+%     X{18} = [1, 1, 2, 2, 2, 2];
+%     X{19} = [1, 2, 1, 2];
 else
     v = i2s(2*ones(1,n-1),1:2^(n-1))-1; % binary form of number 1:2^(n-1)
     X = cell(0);
@@ -177,11 +200,12 @@ end
 
 function Mod0 = TargetModel(n)
 % TARGETGATES generates the target S_n model for n qubits
-% Here as in the proof of S_n model, the basis is the computational one and
-% the "S gate" is the S_y gate, i.e., sqrt(Y)
+% Here as in the proof of S_n model in the Appendix the model is given 
+% in the computational basis, i.e., the "S" gate is actually Rx(pi/2)
 % gates:
 Mod0.gates = cell(1,n);
-S = [1 1i; -1i 1]/2+1i*[1 -1i; 1i 1]/2; % S_y gate
+H = [1, 1; 1, -1]/sqrt(2);
+S = H*[1, 0; 0, 1i]*H'; % R_x(pi/2) gate
 for k=1:n
     U_k = 1;
     for l=1:n
@@ -211,113 +235,140 @@ end
 
 %% ---------- Infidelity ----------
 
-function [inFid,r,s] = Infidelity(Mod0,Mod,n,r,Pfail,ep,nn)
+function [inFid_max,inFid_avg,inFid_rho,inFid_meas,inFid_type] = Infidelity(Mod0,Mod,n)
 % INFIDELITY calculates the infidelity between the channels, states and the
 % measurement
-%   First, the infidelity is calculated. If it is below the one
-%   corresponding to the worst ratio (up to ep), no optimization happens.
-%
-%   nn -- number of random point for the minimization
-%   s -- type of the indifelity that is the largest
+n_opt = 5; % number of points for optimization
 
-V = eye(2^n); % the initial unitary gauge (here the identity)
-
-[~,inFid,s] = funMinPhases(zeros(1,2^n-1),Mod,Mod0,V,n);
-if inFid>r*Pfail && nn>0 % the point is above the line given by the ratio r
-    fun = @(x)funMinPhases(x,Mod,Mod0,V,n);
+flag = 0;
+[fmin,inFid_max,inFid_avg,inFid_rho,inFid_meas,inFid_type] = funMinPhases(zeros(1,2^n-1),Mod,Mod0,n);
+if n_opt>0 
+    fun = @(x)funMinPhases(x,Mod,Mod0,n);
     options = optimoptions('fminunc','Display','off');
-    fmin = 1;
-    for k=1:nn
+    for k=1:n_opt
         [xk,fk] = fminunc(fun,rand(1,2^n-1),options);
         if fk<fmin
             x = xk;
             fmin = fk;
-            [~,inFid,s] = funMinPhases(x,Mod,Mod0,V,n);
-            if inFid<=r*Pfail*(1+ep)
-                break
-            end
+            flag = 1;
         end
     end
-    if inFid>r*Pfail % if it's still above
-        r = inFid/Pfail; % update the coefficient
+    if flag==1
+        [~,inFid_max,inFid_avg,inFid_rho,inFid_meas,inFid_type] = funMinPhases(x,Mod,Mod0,n);
     end
 end
+
 end
 
 %% ---------- Objective function Infidelity ----------
 
-function [fmin,inFid,s] = funMinPhases(x,Mod,Mod0,V,n)
+function [fmin,inFid_max,inFid_avg,inFid_rho,inFid_meas,inFid_type] = funMinPhases(x,Mod,Mod0,n)
 % FUNMINPHASES is the objective function for the minimization in Infidelity
 d = 2^n;
 % construct the gauge
-U = V*diag([1,exp(1i*2*pi*x)]);
+V = eye(d); % possibly add a general gauge
+U = V*diag([1,exp(1i*2*pi*x)]); % diagonal in the computational basis
 
 % calculate the infidelities
 inFid_rho = real(1-trace(Mod.rho*U*Mod0.rho*U'));
 inFid_gates = zeros(1,n);
-for k=1:n
+for k=1:numel(Mod.gates)
     % construct the Choi of the ideal gates
     inFid_gates(k) = (1-real(trace(CJ(Mod.gates{k},d)*CJ(U*Mod0.gates{k}*U',d))))*d/(d+1);
 end
-dist_M = 0; % ! this only works for the readout noise and V = eye(d) !
+inFid_meas = 0; % ! this only works for the readout noise and V = eye(d) !
 for k=1:d
-    dist_M = dist_M+abs(trace(Mod0.rho*(Mod.M{k}-U*Mod0.M{k}*U')))/2;
+    inFid_meas = inFid_meas+abs(trace(Mod0.rho*(Mod.M{k}-U*Mod0.M{k}*U')))/2; % total var distance
+end
+inFid_max = max(inFid_gates);
+inFid_avg = sum(inFid_gates)/numel(Mod.gates);
+[~,inFid_type] = max([inFid_avg,inFid_rho,inFid_meas]);
+
+fmin = inFid_avg; % change here what the objective function of the optimization is
 end
 
-fmin = (inFid_rho+sum(inFid_gates)/n+dist_M)/3; % function for the minimization
-[inFid,s] = max([inFid_rho,max(inFid_gates),dist_M]);
-% maybe add state and measurement
+
+
+%% ----------- Noise model ---------
+function noise = Noise(n,n_gates)
+% NOISE generates the noise model
+d = 2^n;
+% global noise for gates
+noise.Un = cell(1,n_gates);
+for k=1:n_gates
+    Z = randn(d)+1i*randn(d);
+    noise.Un{k}(:,:,1) = Z+Z';
+    Z = randn(d)+1i*randn(d);
+    noise.Un{k}(:,:,2) = Z+Z';
 end
+% local noise for gates
+noise.U1 = cell(1,n_gates);
+for k=1:n_gates
+    for l=1:2*n
+        Z = randn(2)+1i*randn(2);
+        noise.U1{k}(:,:,l) = Z+Z';
+    end
+end
+% depolarizing noise
+noise.dep = rand(1,n_gates);
+
+% statistical noise for the measurement
+noise.M = rand(1,n);
+
+end
+
 
 %% ---------- Noisy model ----------
 
-function Mod = NoisyModel(noise,n,Mod0)
+function Mod = NoisyModel(noise,noise_param,n,Mod0,alpha)
 % NOISYMODEL generates a random noise added to state, channels and measurement
-%   noise -- parameters controlling the ammount of noise (see description
-%   above)
+%   noise -- Noise model
+%   noise_param -- parameters controlling the noise strenth between
+%   different elements
+%   alpha -- general noise strength parameter
 %
 d = 2^n;
 % state (white noise)
-e = noise.rho*noise.alpha*rand(1); % a random level of noise between 0 and noise.rho
-Mod.rho = (1-e)*Mod0.rho+e*eye(d)/d;
+Mod.rho = (1-noise_param.rho*alpha)*Mod0.rho+noise_param.rho*alpha*eye(d)/d;
 % measurement (stochastical noise)
 v = i2s(2*ones(1,n),1:d);
-e = noise.M*noise.alpha*rand(1,d); % a random level of noise for each qubit
-m = cell(1,n);
-for k=1:n
-    m{k}(:,:,1) = [1-e(k) 0; 0 e(k)];
-    m{k}(:,:,2) = [e(k) 0; 0 1-e(k)];
-end
-Mod.M = cell(1,d);
-for k=1:d
-    M_k = 1;
-    for l=1:n
-        M_k = kron(M_k,m{l}(:,:,v(k,l)));
+if noise_param.M~=0  
+    e = noise_param.M*alpha*noise.M; % level of noise for each qubit
+    m = cell(1,n);
+    for k=1:n
+        m{k}(:,:,1) = [1-e(k) 0; 0 e(k)];
+        m{k}(:,:,2) = [e(k) 0; 0 1-e(k)];
     end
-    Mod.M{k} = M_k;
+    Mod.M = cell(1,d);
+    for k=1:d
+        M_k = 1;
+        for l=1:n
+            M_k = kron(M_k,m{l}(:,:,v(k,l)));
+        end
+        Mod.M{k} = M_k;
+    end
+else
+    Mod.M = Mod0.M;
 end
 % gates
-Mod.gates = cell(1,n);
-e_u1 = noise.U1*noise.alpha*rand(2,n,n); % level of single-qubit unitary noise
-e_un = noise.Un*noise.alpha*rand(2,n); % level of n-qubit unitary noise
-% the first index is = 1 for left and = 2 for right noise
-
-for k=1:n
-    % first the unitary noise
-    Ul = 1; %left 
+Mod.gates = cell(1,numel(Mod0.gates));
+for k=1:numel(Mod0.gates)
+    % build the unitary noise
+    Ul = 1; %left
     Ur = 1; % right
     for l=1:n
-        Ul = kron(Ul,RandUnitary(e_u1(1,l,k),2));
-        Ur = kron(Ur,RandUnitary(e_u1(2,l,k),2));
+        Ul = kron(Ul,expm(alpha*1i*noise.U1{k}(:,:,2*l-1)));
+        Ur = kron(Ur,expm(alpha*1i*noise.U1{k}(:,:,2*l)));
     end
-    Ul = Ul*RandUnitary(e_un(1,k),d);
-    Ur = Ur*RandUnitary(e_un(2,k),d);
+    Ul = Ul*expm(alpha*1i*noise.Un{k}(:,:,1));
+    Ur = Ur*expm(alpha*1i*noise.Un{k}(:,:,2));
     Mod.gates{k} = Ur*Mod0.gates{k}*Ul;
 end
-if noise.dep~=0
-    e_dep = noise.dep*noise.alpha*rand(1,n);
+
+if noise_param.dep~=0
+    e_dep = noise.dep*alpha*noise_param.dep;
     E = eye(d);
-    for k=1:n
+    for k=1:numel(Mod.gates)
         Mod.gates{k}(:,:,1) = sqrt(1-e_dep(k))*Mod.gates{k}(:,:,1);
         for i=1:d
             for j=1:d
@@ -326,15 +377,6 @@ if noise.dep~=0
         end
     end
 end
-end
-
-%% ---------- Random unitary ----------
-
-function U = RandUnitary(alpha,d)
-% RANDUNITARY generates a random unitary close to the identity
-%   alpha -- parameter that determines how close U is to the identity
-Z = randn(d)+1i*randn(d);
-U = expm(alpha*1i*(Z+Z'));
 end
 
 
@@ -408,3 +450,4 @@ if isempty(find(intervals_k==k,1))==0 % if k is one of the intervals
     end
 end
 end
+
